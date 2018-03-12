@@ -1,0 +1,664 @@
+// Copyright (c) 2008-2018 LG Electronics, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ **********************************************************************
+ * @file PmKLogDaemon.c
+ *
+ * @brief This file contains the Open WebOS kernel logging daemon
+ * implementation. It loops using klogctl to read kernel messages and
+ * then forwards them to syslog.
+ *
+ * See http://linux.die.net/man/3/klogctl for klogctl documentation, or
+ * the kernel printk.c do_syslog implementation.
+ *
+ ***********************************************************************
+ */
+
+
+#include <errno.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/klog.h>
+#include <sys/socket.h>
+#include <sys/syslog.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "PmKLogDaemon.h"
+
+#define PMLOGDAEMON_LOG_KERN    (LOG_NFACILITIES<<3)
+
+
+/* private constants */
+
+#define PMKLOGD_NAME            "pmklogd"
+
+/* see LOG_BUF_LEN / CONFIG_LOG_BUF_SHIFT in printk.c */
+#define KLOG_BUFFER_SIZE        4096
+#define KLOG_MAX_LINE_LEN       1000
+
+/* see printk.c DEFAULT_MESSAGE_LOGLEVEL */
+#define KLOG_DEFAULT_PRIORITY   LOG_WARNING
+
+
+/* status codes */
+enum
+{
+    RESULT_OK,
+    RESULT_RUN_ERR,
+    RESULT_PARAM_ERR,
+    RESULT_HELP
+};
+
+
+/* states for parsing kernel message prefix */
+typedef enum
+{
+    kParsePriorityReady,
+    kParsePriorityStarted,
+    kParsePriorityDone
+}
+ParsePriorityState;
+
+
+/* global settings */
+
+/* false for no log, true for log */
+static bool     g_statusLog;
+
+/* 0 if daemon, 1 if foreground */
+static int      g_noFork;
+
+/* time to sleep before starting up */
+static int      g_startDelay;
+
+/* time to wait for syslogd before starting up */
+static int      g_syslogdDelay;
+
+
+/* globals */
+static char     gOutBuff[ KLOG_MAX_LINE_LEN + 1 ];
+static int      gOutBuffPos                         = 0;
+static int      gOutPriority;
+static int      gOutPriorityState;
+
+
+/**
+* @brief LogVToDebugKLog
+*/
+static void LogVToDebugKLog(const char *fmt, va_list args)
+{
+	const char *filePath    = "@WEBOS_INSTALL_LOGDIR@/pmklogd.log";
+
+	FILE           *f;
+	int             err;
+	struct timeval  nowTv;
+	time_t          now;
+	char            timeStamp[ 32 ];
+
+	f = fopen(filePath, "a");
+
+	if (f == NULL)
+	{
+		err = errno;
+		fprintf(stderr, COMPONENT_PREFIX "Failed opening pmklogd.log: %s\n",
+		        strerror(err));
+		return;
+	}
+
+	/* generate the timestamp */
+	memset(&nowTv, 0, sizeof(nowTv));
+	(void) gettimeofday(&nowTv, NULL);
+	now = nowTv.tv_sec;
+
+	/**
+	 * ctime => "Wed Jun 30 21:49:08 1993\n"
+	 * note, glibc uses strftime "%h %e %T" using C locale
+	 */
+	mystrcpy(timeStamp, sizeof(timeStamp), ctime(&now) + 4);
+	timeStamp[ 15 ] = 0;
+	fprintf(f, "%s ", timeStamp);
+
+	vfprintf(f, fmt, args);
+
+	(void) fclose(f);
+}
+
+
+/**
+ * @brief PrvPrint
+ *
+ * Bottleneck for status output.
+ */
+void PrvPrint(PrvPrintType printType, const char *fmt, ...)
+{
+	va_list args;
+	FILE   *f;
+
+	va_start(args, fmt);
+
+	/* Note that we don't want to output to syslog! */
+	if (g_statusLog)
+	{
+		LogVToDebugKLog(fmt, args);
+	}
+
+	/* output to console */
+	f = (printType == kPrvPrintError) ? stderr : stdout;
+	fprintf(f, "%s", COMPONENT_PREFIX);
+	vfprintf(f, fmt, args);
+
+	va_end(args);
+}
+
+
+/**
+ * @brief WaitForSysLogD
+ *
+ * If syslogd and klogd were started at the same time, we want to give
+ * syslogd a little time to start listening before we try to write via
+ * syslog.
+ * This function will poll on the syslog device until it can be
+ * connected or the specified timeout has elapsed.
+ * @return true if connected else false.
+ */
+static bool WaitForSysLogD(int secsToWait)
+{
+	const int maxTries = secsToWait;
+
+	struct sockaddr_un  sunx;
+	int                 i;
+	int                 fd;
+	int                 err;
+	int                 result;
+
+	/* path to the unix domain socket = _PATH_LOG = /dev/log */
+	memset(&sunx, 0, sizeof(sunx));
+	sunx.sun_family = AF_UNIX;
+	(void) strncpy(sunx.sun_path, _PATH_LOG, sizeof(sunx.sun_path));
+
+	result = -1;
+
+	for (i = 0; i < maxTries; i++)
+	{
+		fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+		if (fd == -1)
+		{
+			err = errno;
+			ErrPrint("socket error: %s\n", strerror(err));
+			break;
+		}
+
+		result = connect(fd, (struct sockaddr *) &sunx, sizeof(sunx));
+
+		if (result != 0)
+		{
+			err = errno;
+			DbgPrint("connect %s #%d error: %s\n", sunx.sun_path, i + 1,
+			         strerror(err));
+		}
+
+		(void) close(fd);
+
+		if (result == 0)
+		{
+			DbgPrint("connect %s #%d ok\n", sunx.sun_path, i + 1);
+			break;
+		}
+
+		InfoPrint("Waiting for %s\n", sunx.sun_path);
+		sleep(1);
+	}
+
+	if (result != 0)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @brief ProcessKLog
+ */
+static void ProcessKLog(const char *p, int n)
+{
+	int     i;
+	char    c;
+	int counter=0;
+	static FILE *fp=NULL;
+	static bool read_into_file=0;
+	const char* oommsg_start_indicator = "oom-killer";
+	const char* oommsg_end_indicator = "Out of memory:";
+
+	for (i = 0; i < n; i++)
+	{
+		c = p[ i ];
+
+		/* messages should be terminated with a '\n' */
+		if ((c == 0x0A) || (c == 0))
+		{
+			/* we got a complete message, log it
+			 * gOutBuff is of format "[   12.356] kernel message here" where [   12.356] is the monotonic time
+			 * strip monotonic time since pmlogdaemon adds it to the log message */
+		        if(gOutBuff[0] == '[')
+			{
+				for(counter=1; gOutBuff[counter]!=']'; ++counter);
+		        }
+			counter += 2; // 2 indicates stripping the closing ']' at the end of monotonic time and the following space
+
+			syslog(gOutPriority, "%s", gOutBuff+counter);
+
+
+			//HACK!! Grab a OOM message from kernel and log it in /var/log/messages
+			if ((g_strstr_len (gOutBuff+counter, 50, oommsg_start_indicator)) != NULL)	//just scan the first 50 chars
+												//the string is "somebody invoked oom-killer ..."
+			{
+				if(!fp)
+				{
+					fp = fopen("@WEBOS_INSTALL_LOGDIR@/crashd/oom","w");
+				}
+				if(fp)
+				{
+					read_into_file = 1;
+				}
+				//log in /var/log/messages
+				syslog(LOG_INFO, "[] [pmlog] kernel OOM_KILLER_INVOKED {\"CAUSE\": \"%s\"}", gOutBuff+counter);
+			}
+
+                        if(read_into_file)
+			{
+				if(fp)
+				{
+					fprintf(fp, gOutBuff+counter);
+					fprintf(fp, "\n");
+				}
+                        }
+
+			if(g_str_has_prefix (gOutBuff+counter, oommsg_end_indicator))
+			{
+				read_into_file = 0;
+				if(fp)
+				{
+					fclose(fp);
+					fp = NULL;
+				}
+				//log in /var/log/messages
+				syslog(LOG_INFO, "[] [pmlog] kernel OUT_OF_MEMORY {\"VICTIM\": \"%s\"}", gOutBuff+counter+strlen(oommsg_end_indicator)+1); //+1 for stripping the extra space
+			}
+			//END OF HACK
+
+			/* reset the output buffer and priority state */
+			gOutBuffPos = 0;
+			gOutBuff[ gOutBuffPos ] = 0;
+			gOutPriority = KLOG_DEFAULT_PRIORITY;
+			gOutPriorityState = kParsePriorityReady;
+			continue;
+		}
+
+		if (gOutBuffPos >= KLOG_MAX_LINE_LEN)
+		{
+			/* the message was too big, log what we got
+			 * gOutBuff is of format "[   12.356] kernel message here" where [   12.356] is the monotonic time
+                         * strip monotonic time since pmlogdaemon adds it to the log message */
+                        if(gOutBuff[0] == '[')
+			{
+				for(counter=1; gOutBuff[counter]!=']'; ++counter);
+			}
+                        counter += 2; // 2 indicates stripping the closing ']' at the end of monotonic time and the following space
+
+                        syslog(gOutPriority, "%s", gOutBuff+counter);
+
+			/* and reset the output buffer so it will wrap to a continuation line */
+			gOutBuffPos = 0;
+			gOutBuff[ gOutBuffPos ] = 0;
+		}
+
+		if ((gOutPriorityState == kParsePriorityReady) && (c == '<'))
+		{
+			gOutPriority = 0;
+			gOutPriorityState = kParsePriorityStarted;
+			continue;
+		}
+
+		if (gOutPriorityState == kParsePriorityStarted)
+		{
+			if ((c >= '0') && (c <= '9'))
+			{
+				gOutPriority = gOutPriority * 10 + c - '0';
+				continue;
+			}
+
+			if (c == '>')
+			{
+				gOutPriorityState = kParsePriorityDone;
+				continue;
+			}
+
+			/* unexpected char, just log it */
+		}
+
+		gOutPriorityState = kParsePriorityDone;
+
+		gOutBuff[ gOutBuffPos ] = c;
+		gOutBuffPos++;
+		gOutBuff[ gOutBuffPos ] = 0;
+	}
+}
+
+
+/**
+ * @brief QuitKLogD
+ *
+ * Exit based on external signal
+ */
+static void QuitKLogD(int UNUSED(sig))
+{
+	/* if any data is buffered flush it */
+	if (gOutBuffPos > 0)
+	{
+		char c = 0;
+		ProcessKLog(&c, 1);
+	}
+
+	/* enable printk's to console */
+	(void) klogctl(7, NULL, 0);
+
+	/* close the kernel log */
+	(void) klogctl(0, NULL, 0);
+
+	InfoPrint(PMKLOGD_NAME " exiting\n");
+	syslog(LOG_NOTICE, PMKLOGD_NAME " exiting");
+
+	/* Clean up our pid file.  Not necessary, but nice. */
+	UnlockProcess();
+
+	exit(EXIT_SUCCESS);
+}
+
+
+/**
+ * @brief RunKLogD
+ */
+static int RunKLogD(void)
+{
+	int     err;
+	int     result;
+	char    inBuff[ KLOG_BUFFER_SIZE ];
+
+	(void) signal(SIGINT, QuitKLogD);
+	(void) signal(SIGTERM, QuitKLogD);
+	(void) signal(SIGQUIT, QuitKLogD);
+
+	(void) signal(SIGHUP, SIG_IGN);
+
+	/*
+	 * If syslogd was started at the same time, we want to delay
+	 * a bit to make sure it is ready to receive messages
+	 */
+	if (g_startDelay > 0)
+	{
+		sleep(g_startDelay);
+	}
+
+	if (!WaitForSysLogD(g_syslogdDelay))
+	{
+		InfoPrint("syslog socket not found...\n");
+	}
+	else
+	{
+		InfoPrint("syslogd appears ready\n");
+	}
+
+	/* open the syslog, specifying kernel facility
+	 * this will mark the messages with "kernel: " prefix
+	 *
+	 * note: if we use the glibc implementation of syslog functions, it
+	 * does not work to specify LOG_KERN as the facility (because the
+	 * value is 0).  This is 'as designed' behavior, and to work around it
+	 * we would have to include our own implementation of the syslog
+	 * functionality.  That's a viable option, but since we are using
+	 * PmLogDaemon as the syslogd implementation, it's much easier to just
+	 * map to a pseudo-facility and have PmLogDaemon decode it on the other
+	 * side.
+	 */
+#if 1
+	openlog("kernel", 0, PMLOGDAEMON_LOG_KERN);
+#else
+	openlog("kernel", 0, LOG_KERN);
+#endif
+
+	/* open the kernel log */
+	(void) klogctl(1, NULL, 0);
+
+	InfoPrint(PMKLOGD_NAME " started\n");
+	syslog(LOG_NOTICE, PMKLOGD_NAME " started");
+
+	memset(inBuff, 0, sizeof(inBuff));
+	memset(gOutBuff, 0, sizeof(gOutBuff));
+
+	gOutBuffPos = 0;
+	gOutPriority = KLOG_DEFAULT_PRIORITY;
+	gOutPriorityState = kParsePriorityReady;
+
+	for (;;)
+	{
+		/* read from the kernel log */
+		result = klogctl(2, inBuff, sizeof(inBuff) - 1);
+
+		if (result < 0)
+		{
+			err = errno;
+
+			if (err == EINTR)
+			{
+				continue;
+			}
+
+			ErrPrint("klogd: error from klogctl(2): %s\n",
+			         strerror(err));
+			syslog(LOG_ERR, "klogd: error from klogctl(2): %s",
+			       strerror(err));
+			break;
+		}
+
+		ProcessKLog(inBuff, result);
+	}
+
+	return RESULT_OK;
+}
+
+
+/**
+ * @brief InitSettings
+ */
+static void InitSettings(void)
+{
+	g_statusLog = false;
+	g_noFork = 0;
+	g_startDelay = 1;
+	g_syslogdDelay = 20;  /* arbitrary default */
+}
+
+
+/**
+ * @brief ShowUsage
+ */
+static void ShowUsage(void)
+{
+	printf(PMKLOGD_NAME " implements klogd (kernel logging daemon.\n");
+	printf("\n");
+	printf("Usage: " PMKLOGD_NAME " [OPTION...]\n");
+	printf("\n");
+	printf("General options:\n");
+	printf(" -help     Show usage information\n");
+	printf(" -d <n>    Specify startup delay in seconds (default=1)\n");
+	printf(" -n        Run in foreground\n");
+	printf(" -slog     Write pmklogd status log\n");
+}
+
+
+/**
+ * @brief SuggestHelp
+ */
+static void SuggestHelp(void)
+{
+	printf("Use -help for usage information.\n");
+}
+
+
+/**
+ * @brief ParseParams
+ *
+ * Parse the command line parameters.
+ * @return result code.
+ */
+static int ParseParams(int argc, char *const argv[])
+{
+	int             i;
+	const char     *arg;
+	int             n;
+
+	i = 1;
+
+	while (i < argc)
+	{
+		arg = argv[ i ];
+
+		if (strcmp(arg, "-help") == 0)
+		{
+			i++;
+			ShowUsage();
+			return RESULT_HELP;
+		}
+
+		/* option -d => start delay in seconds */
+		if (strcmp(arg, "-d") == 0)
+		{
+			i++;
+
+			if (i >= argc)
+			{
+				printf("Invalid parameter: -d requires value\n");
+				return RESULT_PARAM_ERR;
+			}
+
+			arg = argv[ i ];
+
+			if (!ParseInt(arg, &n))
+			{
+				n = -1;
+			}
+
+			if (!((n >= 0) && (n <= 30)))
+			{
+				printf("Invalid parameter: start delay "
+				       "must be 0..30\n");
+				return RESULT_PARAM_ERR;
+			}
+
+			g_startDelay = n;
+			i++;
+			continue;
+		}
+
+		/* option -n => no fork */
+		if (strcmp(arg, "-n") == 0)
+		{
+			i++;
+			g_noFork = 1;
+			continue;
+		}
+
+		/* option  -slog => status log */
+		if (strcmp(arg, "-slog") == 0)
+		{
+			i++;
+			g_statusLog = true;
+			continue;
+		}
+
+		printf("Invalid parameter: '%s'\n", arg);
+		return RESULT_PARAM_ERR;
+	}
+
+	return RESULT_OK;
+}
+
+
+/**
+ * @brief main
+ */
+int main(int argc, char *argv[])
+{
+	int     result;
+	int     err;
+
+	InitSettings();
+
+	result = ParseParams(argc, argv);
+
+	if (result != RESULT_OK)
+	{
+		if (result != RESULT_HELP)
+		{
+			SuggestHelp();
+		}
+
+		exit(EXIT_FAILURE);
+	}
+
+	InfoPrint(PMKLOGD_NAME " running...\n");
+
+	if (!g_noFork)
+	{
+		/* detach and run as background */
+		if (daemon(0, 1) < 0)
+		{
+			err = errno;
+			ErrPrint("Failed daemonize (err %d, %s), exiting.\n",
+			         err, strerror(err));
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	/*
+	 * make sure we aren't already running.
+	 * Note: this needs to be *after* we've forked, since it relies
+	 * on a process-specific advisory file lock.
+	 */
+	if (!LockProcess(PMKLOGD_NAME))
+	{
+		exit(EXIT_FAILURE);
+	}
+
+	/* service the syslog socket */
+	result = RunKLogD();
+
+	if (result != RESULT_OK)
+	{
+		exit(EXIT_FAILURE);
+	}
+
+	exit(EXIT_SUCCESS);
+}
