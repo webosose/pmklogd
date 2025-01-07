@@ -290,7 +290,7 @@ static void ProcessKLog(const char *p, int n)
 			{
 				if(fp)
 				{
-					fprintf(fp, gOutBuff+counter);
+					fprintf(fp, "%s", gOutBuff+counter);
 					fprintf(fp, "\n");
 				}
                         }

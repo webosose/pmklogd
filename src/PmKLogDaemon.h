@@ -32,6 +32,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include <glib.h>
+
 
 /* helper for suppressing gcc 'unused function parameter' warnings */
 #define UNUSED(x) x __attribute__((unused))
